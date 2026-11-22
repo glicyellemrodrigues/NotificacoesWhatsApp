@@ -14,6 +14,11 @@
  *   GREENAPI_TOKEN_INSTANCE-> apiTokenInstance do seu instance no Green API
  *   JANELA_DIAS            -> (opcional) quantos dias à frente contam como "vencendo em breve".
  *                             Padrão: "5". As que vencem hoje têm seção própria.
+ *
+ * Além dos lembretes de vencimento, o serviço avisa quando um mês é QUITADO: assim que a
+ * última conta em aberto de um mês é paga, sai uma mensagem de fechamento. O controle do que
+ * já foi avisado fica em appSettings.notificacoes.mesesQuitadosAvisados, para a mensagem não
+ * se repetir a cada execução. Se o mês voltar a ter conta em aberto, o aviso é rearmado.
  */
 
 const admin = require('firebase-admin');
@@ -90,6 +95,65 @@ async function enviarGreenAPI(numero, texto) {
   return { ok: resp.ok, status: resp.status, body: body.slice(0, 300) };
 }
 
+// Resumo de um mês: quantas despesas tem, quantas estão em aberto e o total pago
+function resumoDoMes(database, anoKey, mesNome) {
+  const despesas = database?.[anoKey]?.monthlyDetails?.[mesNome]?.expenses || [];
+  const emAberto = despesas.filter((e) => !e.paid);
+  return {
+    ano: anoKey,
+    mes: mesNome,
+    chave: `${mesNome}/${anoKey}`,
+    total: despesas.length,
+    emAberto: emAberto.length,
+    quitado: despesas.length > 0 && emAberto.length === 0,
+    valorPago: despesas.filter((e) => e.paid).reduce((s, e) => s + (e.value || 0), 0),
+  };
+}
+
+/**
+ * Decide se deve sair o aviso de "mês quitado".
+ * - candidatos: mês anterior e mês atual (os dois que o sistema acompanha).
+ * - um mês só é avisado uma vez; se voltar a ter conta em aberto, o aviso é rearmado.
+ * - na primeira execução (estado ainda inexistente) o serviço apenas registra a situação,
+ *   sem disparar mensagem, para não avisar meses que já estavam fechados antes.
+ * Devolve { avisar, estado, inicializou }.
+ */
+function avaliarMesesQuitados(candidatos, estadoAtual) {
+  const primeiraVez = !Array.isArray(estadoAtual);
+  const jaAvisados = new Set(primeiraVez ? [] : estadoAtual);
+
+  // mês que voltou a ter conta em aberto deixa de estar avisado
+  for (const c of candidatos) {
+    if (c.emAberto > 0) jaAvisados.delete(c.chave);
+  }
+
+  const quitadosNovos = candidatos.filter((c) => c.quitado && !jaAvisados.has(c.chave));
+
+  if (primeiraVez) {
+    // registra a situação atual sem enviar nada
+    quitadosNovos.forEach((c) => jaAvisados.add(c.chave));
+    return { avisar: null, estado: [...jaAvisados], inicializou: true };
+  }
+
+  // no máximo um aviso por execução: o mês mais recente que acabou de fechar
+  const avisar = quitadosNovos.length ? quitadosNovos[quitadosNovos.length - 1] : null;
+  if (avisar) jaAvisados.add(avisar.chave);
+  return { avisar, estado: [...jaAvisados], inicializou: false };
+}
+
+// Mensagem de fechamento do mês
+function montarMensagemQuitado(resumo, proximos) {
+  let msg = `✅ *Contas em dia!* — ${resumo.mes}/${resumo.ano}\n\n`;
+  msg += `Todas as contas de *${resumo.mes}/${resumo.ano}* foram pagas. 🎉\n\n`;
+  msg += `*Contas pagas:* ${resumo.total}\n`;
+  msg += `*Total pago:* ${moeda(resumo.valorPago)}`;
+  if (proximos && proximos.qtd > 0) {
+    msg += `\n\n_Em ${proximos.mes}/${proximos.ano} há ${proximos.qtd} conta(s) em aberto, somando ${moeda(proximos.valor)}._`;
+  }
+  msg += `\n\n_Controle Financeiro PRO_`;
+  return msg;
+}
+
 async function main() {
   if (!process.env.SERVICE_ACCOUNT) throw new Error('Falta o secret SERVICE_ACCOUNT.');
   if (!process.env.APP_EMAIL) throw new Error('Falta o secret APP_EMAIL.');
@@ -100,7 +164,8 @@ async function main() {
   admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.SERVICE_ACCOUNT)) });
 
   const user = await admin.auth().getUserByEmail(process.env.APP_EMAIL);
-  const snap = await admin.firestore().collection('users').doc(user.uid).get();
+  const userRef = admin.firestore().collection('users').doc(user.uid);
+  const snap = await userRef.get();
   if (!snap.exists) { console.log('Documento do usuário não encontrado. Nada a fazer.'); return; }
   const database = snap.data();
 
@@ -185,8 +250,61 @@ async function main() {
     else if (diff <= JANELA_DIAS) emBreve.push({ e, venc, diff });
   }
 
+  // ===== Aviso de mês quitado =====
+  // Antes, quando a última conta em aberto era paga, o serviço simplesmente parava de enviar
+  // e o usuário ficava sem retorno. Agora sai uma mensagem de fechamento do mês.
+  const candidatosQuitados = [
+    resumoDoMes(database, anoPrevKey, mesNomePrev),
+    resumoDoMes(database, anoKey, mesNome),
+  ];
+  const estadoSalvo = (cfg.notificacoes || {}).mesesQuitadosAvisados;
+  const { avisar: mesQuitado, estado: novoEstado, inicializou } = avaliarMesesQuitados(candidatosQuitados, estadoSalvo);
+
+  if (inicializou) {
+    console.log(`Primeira execução do aviso de mês quitado. Situação registrada: ${novoEstado.join(', ') || '(nenhum mês fechado)'}. Nada enviado por isso.`);
+  }
+  if (JSON.stringify(novoEstado) !== JSON.stringify(estadoSalvo || [])) {
+    try {
+      await userRef.set({ appSettings: { notificacoes: { mesesQuitadosAvisados: novoEstado } } }, { merge: true });
+    } catch (err) {
+      console.error('Não foi possível gravar o controle de meses avisados:', err.message);
+    }
+  }
+
+  let msgQuitado = null;
+  if (mesQuitado) {
+    // se o outro mês ainda tem contas em aberto, a mensagem já avisa
+    const outro = candidatosQuitados.find((c) => c.chave !== mesQuitado.chave && c.emAberto > 0);
+    const proximos = outro
+      ? {
+          mes: outro.mes,
+          ano: outro.ano,
+          qtd: outro.emAberto,
+          valor: (database?.[outro.ano]?.monthlyDetails?.[outro.mes]?.expenses || [])
+            .filter((e) => !e.paid)
+            .reduce((s, e) => s + (e.value || 0), 0),
+        }
+      : null;
+    msgQuitado = montarMensagemQuitado(mesQuitado, proximos);
+    console.log(`Mês quitado: ${mesQuitado.chave} (${mesQuitado.total} conta(s), ${moeda(mesQuitado.valorPago)}). Enviando aviso de fechamento.`);
+  }
+
   if (emBreve.length === 0 && hoje.length === 0 && vencidas.length === 0) {
-    console.log('Nada a vencer (em breve/hoje) nem vencido. Nada será enviado.');
+    if (!msgQuitado) {
+      console.log('Nada a vencer (em breve/hoje) nem vencido. Nada será enviado.');
+      return;
+    }
+    if (contatos.length === 0) { console.log('Nenhum contato com número cadastrado. Nada enviado.'); return; }
+    for (const c of contatos) {
+      try {
+        const r = await enviarGreenAPI(c.number, msgQuitado);
+        console.log(`Aviso de mês quitado enviado para ${c.name} (${c.number}): status ${r.status} | ${r.body}`);
+      } catch (err) {
+        console.error(`Falha ao enviar o aviso de mês quitado para ${c.name}:`, err.message);
+      }
+      await sleep(2000);
+    }
+    console.log('Concluído.');
     return;
   }
 
@@ -263,7 +381,8 @@ async function main() {
 
   // Página 1 = despesas, Página 2 = orçamentos (cada página só é subdividida em casos extremos)
   let partes = [];
-  for (const pagina of [msgDespesas, msgOrcamentos]) partes = partes.concat(dividirMensagem(pagina));
+  const paginas = msgQuitado ? [msgQuitado, msgDespesas, msgOrcamentos] : [msgDespesas, msgOrcamentos];
+  for (const pagina of paginas) partes = partes.concat(dividirMensagem(pagina));
 
   for (const c of contatos) {
     for (let i = 0; i < partes.length; i++) {
@@ -280,4 +399,8 @@ async function main() {
   console.log('Concluído.');
 }
 
-main().catch((err) => { console.error('Erro:', err.message); process.exit(1); });
+if (require.main === module) {
+  main().catch((err) => { console.error('Erro:', err.message); process.exit(1); });
+}
+
+module.exports = { resumoDoMes, avaliarMesesQuitados, montarMensagemQuitado };
